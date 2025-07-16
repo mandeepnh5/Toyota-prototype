@@ -279,16 +279,16 @@ def display_welding_results(results):
                     original_image, predictions, confidence_threshold
                 )
                 
-                # Display images side by side
-                col1, col2 = st.columns(2)
+                # # Display images side by side
+                # col1, col2 = st.columns(2)
                 
-                with col1:
-                    st.write("**Original Image**")
-                    st.image(original_image, caption="Original", use_container_width=True)
+                # with col1:
+                #     st.write("**Original Image**")
+                #     st.image(original_image, caption="Original", use_container_width=True)
                 
-                with col2:
-                    st.write("**Annotated Image**")
-                    st.image(annotated_image, caption="With Detections", use_container_width=True)
+                
+                st.write("**Annotated Image**")
+                st.image(annotated_image, caption="With Detections", use_container_width=True)
                 
                 # Show color legend
                 if class_colors:
