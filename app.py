@@ -6,7 +6,6 @@ import io
 import base64
 import pandas as pd
 from datetime import datetime
-from inference_sdk import InferenceHTTPClient
 import numpy as np
 
 # Configure page
@@ -17,10 +16,8 @@ st.set_page_config(
 )
 
 # Roboflow API Configuration
-CLIENT = InferenceHTTPClient(
-    api_url="https://serverless.roboflow.com",
-    api_key="lSiEtOHDatuVU8fZN0iS"
-)
+ROBOFLOW_API_URL = "https://serverless.roboflow.com"
+ROBOFLOW_API_KEY = "lSiEtOHDatuVU8fZN0iS"
 MODEL_ID = "weld-4qosh/1"
 
 # Custom CSS for better styling
@@ -156,7 +153,7 @@ def draw_detections_on_image(image, predictions, confidence_threshold=0.0):
 
 def call_roboflow_api(image):
     """
-    Call the Roboflow welding detection API
+    Call the Roboflow welding detection API using requests
     """
     try:
         # Convert PIL Image to base64 string
@@ -164,10 +161,25 @@ def call_roboflow_api(image):
         image.save(buffered, format="JPEG")
         image_base64 = base64.b64encode(buffered.getvalue()).decode()
         
-        # Call Roboflow API with base64 string
-        result = CLIENT.infer(image_base64, model_id=MODEL_ID)
+        # Prepare the API request
+        url = f"{ROBOFLOW_API_URL}/{MODEL_ID}"
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
         
-        return True, result
+        # Send request to Roboflow API
+        response = requests.post(
+            url,
+            data=image_base64,
+            headers=headers,
+            params={"api_key": ROBOFLOW_API_KEY}
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return True, result
+        else:
+            return False, f"API Error: {response.status_code} - {response.text}"
             
     except Exception as e:
         return False, f"Roboflow API Error: {str(e)}"
@@ -372,8 +384,6 @@ def main():
     # Main header
     st.markdown('<h1 class="main-header">🔧 Welding Image Analysis</h1>', unsafe_allow_html=True)
     
-    # Show API info
-    st.info(f"🔗 Using Roboflow Welding Detection Model")
     
     # Main content area
     col1, col2 = st.columns([1, 1])
@@ -438,20 +448,7 @@ def main():
             display_welding_results(st.session_state.analysis_results)
         else:
             st.info("👆 Upload an image and click 'Analyze' to see results here")
-            
-            # Add sample data testing
-            with st.expander("🧪 Test with Sample Data"):
-                st.write("Click below to test the display with sample welding analysis data:")
-                if st.button("Load Sample Results"):
-                    try:
-                        with open("sample_response.json", "r") as f:
-                            sample_data = json.load(f)
-                        st.info("📊 Displaying sample welding analysis results")
-                        display_welding_results(sample_data)
-                    except FileNotFoundError:
-                        st.warning("Sample data file not found")
-                    except Exception as e:
-                        st.error(f"Error loading sample data: {str(e)}")
+        
     
 
 if __name__ == "__main__":
