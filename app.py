@@ -1,11 +1,13 @@
 import streamlit as st
 import requests
 import json
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import io
 import base64
 import pandas as pd
 from datetime import datetime
+from inference_sdk import InferenceHTTPClient
+import numpy as np
 
 # Configure page
 st.set_page_config(
@@ -14,8 +16,12 @@ st.set_page_config(
     layout="wide"
 )
 
-# API Configuration - Fixed endpoint
-API_ENDPOINT = "http://127.0.0.1:8001/predict"
+# Roboflow API Configuration
+CLIENT = InferenceHTTPClient(
+    api_url="https://serverless.roboflow.com",
+    api_key="lSiEtOHDatuVU8fZN0iS"
+)
+MODEL_ID = "weld-4qosh/1"
 
 # Custom CSS for better styling
 st.markdown("""
@@ -62,286 +68,289 @@ def encode_image_to_base64(image):
     img_str = base64.b64encode(buffered.getvalue()).decode()
     return img_str
 
-def call_welding_api_multipart(image, api_url, api_key=None):
+def draw_detections_on_image(image, predictions, confidence_threshold=0.0):
     """
-    Call the welding analysis API using multipart/form-data
+    Draw bounding boxes and labels on the image
+    """
+    # Create a copy of the image to draw on
+    img_with_boxes = image.copy()
+    draw = ImageDraw.Draw(img_with_boxes)
+    
+    # Try to use a better font, fall back to default if not available
+    try:
+        font = ImageFont.truetype("arial.ttf", 20)
+        small_font = ImageFont.truetype("arial.ttf", 16)
+    except:
+        try:
+            font = ImageFont.load_default()
+            small_font = ImageFont.load_default()
+        except:
+            font = None
+            small_font = None
+    
+    # Color palette for different classes
+    colors = [
+        "#FF0000",  # Red
+        "#00FF00",  # Green
+        "#0000FF",  # Blue
+        "#FFFF00",  # Yellow
+        "#FF00FF",  # Magenta
+        "#00FFFF",  # Cyan
+        "#FFA500",  # Orange
+        "#800080",  # Purple
+        "#FFC0CB",  # Pink
+        "#A52A2A",  # Brown
+    ]
+    
+    # Keep track of class colors
+    class_colors = {}
+    color_index = 0
+    
+    for pred in predictions:
+        confidence = pred.get("confidence", 0)
+        
+        # Only draw boxes above confidence threshold
+        if confidence >= confidence_threshold:
+            x_center = pred.get("x", 0)
+            y_center = pred.get("y", 0)
+            width = pred.get("width", 0)
+            height = pred.get("height", 0)
+            class_name = pred.get("class", "unknown")
+            
+            # Calculate bounding box coordinates
+            x1 = x_center - width / 2
+            y1 = y_center - height / 2
+            x2 = x_center + width / 2
+            y2 = y_center + height / 2
+            
+            # Assign color to class
+            if class_name not in class_colors:
+                class_colors[class_name] = colors[color_index % len(colors)]
+                color_index += 1
+            
+            box_color = class_colors[class_name]
+            
+            # Draw bounding box
+            draw.rectangle([x1, y1, x2, y2], outline=box_color, width=3)
+            
+            # Prepare label text
+            label = f"{class_name}: {confidence:.2%}"
+            
+            # Get text size for background rectangle
+            if font:
+                bbox = draw.textbbox((0, 0), label, font=font)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+            else:
+                text_width = len(label) * 6  # Approximate width
+                text_height = 14  # Approximate height
+            
+            # Draw label background
+            label_bg = [x1, y1 - text_height - 5, x1 + text_width + 10, y1]
+            draw.rectangle(label_bg, fill=box_color)
+            
+            # Draw label text
+            draw.text((x1 + 5, y1 - text_height - 2), label, fill="white", font=font)
+    
+    return img_with_boxes, class_colors
+
+def call_roboflow_api(image):
+    """
+    Call the Roboflow welding detection API
     """
     try:
-        # Prepare headers
-        headers = {}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        
-        # Convert image to bytes
+        # Convert PIL Image to base64 string
         buffered = io.BytesIO()
         image.save(buffered, format="JPEG")
-        image_bytes = buffered.getvalue()
+        image_base64 = base64.b64encode(buffered.getvalue()).decode()
         
-        # Prepare files for multipart upload
-        files = {
-            'image': ('image.jpg', image_bytes, 'image/jpeg'),
-        }
+        # Call Roboflow API with base64 string
+        result = CLIENT.infer(image_base64, model_id=MODEL_ID)
         
-        # Make API call
-        response = requests.post(
-            api_url,
-            headers=headers,
-            files=files,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            return True, response.json()
-        else:
-            return False, f"Multipart API Error: {response.status_code} - {response.text}"
+        return True, result
             
-    except requests.exceptions.RequestException as e:
-        return False, f"Multipart Request Error: {str(e)}"
     except Exception as e:
-        return False, f"Multipart Unexpected Error: {str(e)}"
+        return False, f"Roboflow API Error: {str(e)}"
 
-def call_welding_api(image_data, api_url, api_key=None):
+def process_roboflow_results(raw_result):
     """
-    Call the welding analysis API with multiple format support
+    Process Roboflow API results into a more readable format
     """
-    try:
-        # Prepare headers
-        headers = {
-            "Content-Type": "application/json"
-        }
+    processed = {
+        "model_id": raw_result.get("model_id", MODEL_ID),
+        "time": raw_result.get("time", 0),
+        "image_info": {
+            "width": raw_result.get("image", {}).get("width", 0),
+            "height": raw_result.get("image", {}).get("height", 0)
+        },
+        "predictions": raw_result.get("predictions", []),
+        "detection_count": len(raw_result.get("predictions", [])),
+        "confidence_threshold": 0.5
+    }
+    
+    # Process predictions
+    if processed["predictions"]:
+        classes_detected = list(set([pred.get("class", "unknown") for pred in processed["predictions"]]))
+        processed["classes_detected"] = classes_detected
+        processed["class_counts"] = {cls: sum(1 for pred in processed["predictions"] if pred.get("class") == cls) for cls in classes_detected}
         
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        # Calculate average confidence
+        confidences = [pred.get("confidence", 0) for pred in processed["predictions"]]
+        processed["average_confidence"] = sum(confidences) / len(confidences) if confidences else 0
         
-        # Try different payload formats based on common API patterns
-        payloads_to_try = [
-            # Format 1: Direct image field
-            {
-                "image": image_data
-            },
-            # Format 2: Base64 with data URL prefix
-            {
-                "image": f"data:image/jpeg;base64,{image_data}"
-            },
-            # Format 3: Nested structure
-            {
-                "data": {
-                    "image": image_data
-                }
-            },
-            # Format 4: File-like structure
-            {
-                "image": image_data,
-                "timestamp": datetime.now().isoformat(),
-                "format": "base64"
-            }
-        ]
-        
-        # Try each payload format
-        for i, payload in enumerate(payloads_to_try):
-            try:
-                response = requests.post(
-                    api_url,
-                    headers=headers,
-                    json=payload,
-                    timeout=30
-                )
-                
-                if response.status_code == 200:
-                    return True, response.json()
-                elif response.status_code == 422 and i < len(payloads_to_try) - 1:
-                    # Try next format for 422 errors
-                    continue
-                else:
-                    # For other errors or last attempt, return the error
-                    return False, f"API Error: {response.status_code} - {response.text}"
-                    
-            except requests.exceptions.RequestException as e:
-                if i == len(payloads_to_try) - 1:  # Last attempt
-                    return False, f"Request Error: {str(e)}"
-                continue
-        
-        return False, "All payload formats failed"
-            
-    except Exception as e:
-        return False, f"Unexpected Error: {str(e)}"
+        # Get highest confidence detection
+        if confidences:
+            max_conf_idx = confidences.index(max(confidences))
+            processed["highest_confidence_detection"] = processed["predictions"][max_conf_idx]
+    
+    return processed
 
 def display_welding_results(results):
     """
-    Display welding analysis results in a structured format
+    Display Roboflow welding detection results
     """
     if not results:
         st.error("No results to display")
         return
     
     # Create tabs for different sections
-    # tabs = st.tabs(["📊 Summary", "�️ Images", "�🔍 Detailed Analysis", "📈 Metrics", "📋 Raw Data"])
-    tabs = st.tabs(["�️ Images", "📋 Raw Data"])
-
+    tabs = st.tabs(["📊 Summary", "�️ Annotated Image", "�🔍 Detections", "📋 Raw Data"])
     
-    # with tabs[0]:  # Summary
-    #     st.subheader("🔍 Analysis Summary")
+    with tabs[0]:  # Summary
+        st.subheader("🔍 Detection Summary")
         
-    #     # Check for common result fields
-    #     if "quality_score" in results:
-    #         col1, col2, col3 = st.columns(3)
-    #         with col1:
-    #             st.metric("Quality Score", f"{results['quality_score']:.2f}")
-    #         with col2:
-    #             if "defect_count" in results:
-    #                 st.metric("Defects Found", results["defect_count"])
-    #         with col3:
-    #             if "confidence" in results:
-    #                 st.metric("Confidence", f"{results['confidence']:.1%}")
+        # Display key metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Detections", results.get("detection_count", 0))
+        with col2:
+            st.metric("Average Confidence", f"{results.get('average_confidence', 0):.2%}")
+        with col3:
+            st.metric("Processing Time", f"{results.get('time', 0):.3f}s")
         
-    #     # Overall status
-    #     if "status" in results:
-    #         status = results["status"].lower()
-    #         if status == "pass" or status == "good":
-    #             st.success(f"✅ Status: {results['status']}")
-    #         elif status == "fail" or status == "poor":
-    #             st.error(f"❌ Status: {results['status']}")
-    #         else:
-    #             st.warning(f"⚠️ Status: {results['status']}")
+        # Show detected classes
+        if "classes_detected" in results:
+            st.write("### Detected Classes")
+            for cls in results["classes_detected"]:
+                count = results.get("class_counts", {}).get(cls, 0)
+                st.write(f"- **{cls}**: {count} detection(s)")
         
-    #     # Additional summary fields
-    #     summary_fields = ["analysis_time", "model_version", "timestamp", "processing_time"]
-    #     for field in summary_fields:
-    #         if field in results:
-    #             st.write(f"**{field.replace('_', ' ').title()}**: {results[field]}")
+        # Show image info
+        if "image_info" in results:
+            img_info = results["image_info"]
+            st.write(f"**Image Size**: {img_info.get('width', 0)} x {img_info.get('height', 0)} pixels")
+        
+        # Show model info
+        st.write(f"**Model**: {results.get('model_id', 'N/A')}")
     
-    with tabs[0]:  # Images
-        st.subheader("🖼️ Analysis Images")
+    with tabs[1]:  # Annotated Image
+        st.subheader("🖼️ Detection Visualization")
         
-        # Display original image if available
-        # if "analyzed_image" in st.session_state:
-        #     st.write("### Original Image")
-        #     st.image(st.session_state.analyzed_image, caption="Original Uploaded Image", use_column_width=True)
+        # Add confidence threshold slider
+        confidence_threshold = st.slider(
+            "Confidence Threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.0,
+            step=0.05,
+            help="Only show detections above this confidence level"
+        )
         
-        # Display base64 images from API response
-        image_fields = ["result_image", "processed_image", "annotated_image", "output_image", "image", "base64_image"]
-        
-        for field in image_fields:
-            if field in results:
-                try:
-                    image_data = results[field]
-                    # Handle different base64 formats
-                    if isinstance(image_data, str):
-                        # Remove data URL prefix if present
-                        if image_data.startswith('data:image'):
-                            image_data = image_data.split(',')[1]
-                        
-                        # Decode base64 image
-                        image_bytes = base64.b64decode(image_data)
-                        image = Image.open(io.BytesIO(image_bytes))
-                        
-                        st.write(f"### {field.replace('_', ' ').title()}")
-                        st.image(image, caption=f"API Response - {field}", use_column_width=True)
-                        
-                        # Show image info
-                        st.write(f"**Dimensions**: {image.size[0]} x {image.size[1]} pixels")
-                        
-                except Exception as e:
-                    st.warning(f"Could not display {field}: {str(e)}")
-        
-        # Display image arrays or other image data
-        if "images" in results and isinstance(results["images"], list):
-            st.write("### Additional Images")
-            for i, img_data in enumerate(results["images"]):
-                try:
-                    if isinstance(img_data, str):
-                        if img_data.startswith('data:image'):
-                            img_data = img_data.split(',')[1]
-                        image_bytes = base64.b64decode(img_data)
-                        image = Image.open(io.BytesIO(image_bytes))
-                        st.image(image, caption=f"Image {i+1}", use_column_width=True)
-                except Exception as e:
-                    st.warning(f"Could not display image {i+1}: {str(e)}")
-    
-    # with tabs[2]:  # Detailed Analysis
-    #     st.subheader("🔍 Detailed Analysis")
-        
-    #     # Defects section
-    #     if "defects" in results and results["defects"]:
-    #         st.write("### Detected Defects")
-    #         defects_df = pd.DataFrame(results["defects"])
-    #         st.dataframe(defects_df, use_container_width=True)
+        # Get the original image from session state
+        if "analyzed_image" in st.session_state:
+            original_image = st.session_state.analyzed_image
+            predictions = results.get("predictions", [])
             
-    #         # Show defect details
-    #         for i, defect in enumerate(results["defects"]):
-    #             with st.expander(f"Defect {i+1}: {defect.get('type', 'Unknown')}"):
-    #                 for key, value in defect.items():
-    #                     st.write(f"**{key.replace('_', ' ').title()}**: {value}")
-        
-    #     # Measurements section
-    #     if "measurements" in results:
-    #         st.write("### Measurements")
-    #         measurements = results["measurements"]
-    #         if isinstance(measurements, dict):
-    #             col1, col2 = st.columns(2)
-    #             items = list(measurements.items())
-    #             mid = len(items) // 2
+            if predictions:
+                # Draw bounding boxes on the image
+                annotated_image, class_colors = draw_detections_on_image(
+                    original_image, predictions, confidence_threshold
+                )
                 
-    #             with col1:
-    #                 for key, value in items[:mid]:
-    #                     st.metric(key.replace('_', ' ').title(), value)
+                # Display images side by side
+                col1, col2 = st.columns(2)
                 
-    #             with col2:
-    #                 for key, value in items[mid:]:
-    #                     st.metric(key.replace('_', ' ').title(), value)
-    #         else:
-    #             st.write(measurements)
-        
-    #     # Recommendations
-    #     if "recommendations" in results:
-    #         st.write("### Recommendations")
-    #         recommendations = results["recommendations"]
-    #         if isinstance(recommendations, list):
-    #             for i, rec in enumerate(recommendations, 1):
-    #                 st.write(f"**{i}.** {rec}")
-    #         else:
-    #             st.write(recommendations)
-        
-    #     # Additional analysis fields
-    #     analysis_fields = ["weld_quality", "structural_integrity", "material_properties", "heat_treatment"]
-    #     for field in analysis_fields:
-    #         if field in results:
-    #             st.write(f"### {field.replace('_', ' ').title()}")
-    #             if isinstance(results[field], dict):
-    #                 for key, value in results[field].items():
-    #                     st.write(f"**{key.replace('_', ' ').title()}**: {value}")
-    #             else:
-    #                 st.write(results[field])
+                with col1:
+                    st.write("**Original Image**")
+                    st.image(original_image, caption="Original", use_container_width=True)
+                
+                with col2:
+                    st.write("**Annotated Image**")
+                    st.image(annotated_image, caption="With Detections", use_container_width=True)
+                
+                # Show color legend
+                if class_colors:
+                    st.write("### Detection Legend")
+                    legend_cols = st.columns(len(class_colors))
+                    for i, (class_name, color) in enumerate(class_colors.items()):
+                        with legend_cols[i]:
+                            st.markdown(f"""
+                            <div style="display: flex; align-items: center; margin-bottom: 5px;">
+                                <div style="width: 20px; height: 20px; background-color: {color}; margin-right: 10px; border: 1px solid #000;"></div>
+                                <span>{class_name}</span>
+                            </div>
+                            """, unsafe_allow_html=True)
+                
+                # Download button for annotated image
+                buffered = io.BytesIO()
+                annotated_image.save(buffered, format="PNG")
+                st.download_button(
+                    label="📥 Download Annotated Image",
+                    data=buffered.getvalue(),
+                    file_name=f"welding_detection_annotated_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                    mime="image/png"
+                )
+                
+            else:
+                st.info("No detections found in the image")
+                st.image(original_image, caption="Original Image", use_container_width=True)
+        else:
+            st.warning("Original image not found in session state")
     
-    # with tabs[3]:  # Metrics
-    #     st.subheader("📈 Performance Metrics")
+    with tabs[2]:  # Detections
+        st.subheader("🔍 Detection Details")
         
-    #     # Create metrics visualization
-    #     metrics_data = []
-    #     for key, value in results.items():
-    #         if isinstance(value, (int, float)) and not isinstance(value, bool):
-    #             metrics_data.append({"Metric": key.replace('_', ' ').title(), "Value": value})
-        
-    #     if metrics_data:
-    #         metrics_df = pd.DataFrame(metrics_data)
-    #         st.dataframe(metrics_df, use_container_width=True)
+        predictions = results.get("predictions", [])
+        if predictions:
+            # Create DataFrame for detections
+            detection_data = []
+            for i, pred in enumerate(predictions):
+                detection_data.append({
+                    "Detection": i + 1,
+                    "Class": pred.get("class", "unknown"),
+                    "Confidence": f"{pred.get('confidence', 0):.2%}",
+                    "X": pred.get("x", 0),
+                    "Y": pred.get("y", 0),
+                    "Width": pred.get("width", 0),
+                    "Height": pred.get("height", 0)
+                })
             
-    #         # Bar chart for numeric values
-    #         numeric_metrics = [m for m in metrics_data if isinstance(m["Value"], (int, float)) and m["Value"] <= 100]
-    #         if numeric_metrics:
-    #             chart_df = pd.DataFrame(numeric_metrics)
-    #             st.bar_chart(chart_df.set_index("Metric"))
-        
-    #     # Score breakdown if available
-    #     if "scores" in results:
-    #         st.write("### Score Breakdown")
-    #         scores = results["scores"]
-    #         if isinstance(scores, dict):
-    #             for category, score in scores.items():
-    #                 st.progress(score / 100 if score > 1 else score, text=f"{category.replace('_', ' ').title()}: {score}")
+            df = pd.DataFrame(detection_data)
+            st.dataframe(df, use_container_width=True)
+            
+            # Show individual detection details
+            for i, pred in enumerate(predictions):
+                with st.expander(f"Detection {i+1}: {pred.get('class', 'unknown')} ({pred.get('confidence', 0):.2%})"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write(f"**Class**: {pred.get('class', 'unknown')}")
+                        st.write(f"**Confidence**: {pred.get('confidence', 0):.2%}")
+                        st.write(f"**Class ID**: {pred.get('class_id', 'N/A')}")
+                    with col2:
+                        st.write(f"**X**: {pred.get('x', 0)}")
+                        st.write(f"**Y**: {pred.get('y', 0)}")
+                        st.write(f"**Width**: {pred.get('width', 0)}")
+                        st.write(f"**Height**: {pred.get('height', 0)}")
+                        
+                    # Show detection box coordinates
+                    if all(key in pred for key in ['x', 'y', 'width', 'height']):
+                        x, y, w, h = pred['x'], pred['y'], pred['width'], pred['height']
+                        st.write(f"**Bounding Box**: ({x-w/2:.0f}, {y-h/2:.0f}) to ({x+w/2:.0f}, {y+h/2:.0f})")
+        else:
+            st.info("No detections found in the image")
     
-    with tabs[1]:  # Raw Data
-        st.subheader("📋 Raw API Response")
+    with tabs[3]:  # Raw Data
+        st.subheader("📋 Raw Detection Data")
         
         # Show formatted JSON
         st.json(results)
@@ -355,7 +364,7 @@ def display_welding_results(results):
         st.download_button(
             label="📥 Download Results as JSON",
             data=result_json,
-            file_name=f"welding_analysis_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            file_name=f"welding_detection_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json"
         )
 
@@ -363,10 +372,8 @@ def main():
     # Main header
     st.markdown('<h1 class="main-header">🔧 Welding Image Analysis</h1>', unsafe_allow_html=True)
     
-    # Show API endpoint
-    st.info(f"🔗 API Endpoint: {API_ENDPOINT}")
-    
-    
+    # Show API info
+    st.info(f"🔗 Using Roboflow Welding Detection Model")
     
     # Main content area
     col1, col2 = st.columns([1, 1])
@@ -384,7 +391,7 @@ def main():
         if uploaded_file is not None:
             # Display uploaded image
             image = Image.open(uploaded_file)
-            st.image(image, caption="Uploaded Image", use_column_width=True)
+            st.image(image, caption="Uploaded Image", use_container_width=True)
             
             # Image info
             st.write(f"**File name:** {uploaded_file.name}")
@@ -393,35 +400,36 @@ def main():
             
             # Analysis button
             if st.button("🔍 Analyze Image", type="primary", use_container_width=True):
-                with st.spinner("Analyzing image... This may take a few moments."):
-                    # Try JSON format first
-                    image_base64 = encode_image_to_base64(image)
-                    success, result = call_welding_api(image_base64, API_ENDPOINT, None)
-                    
-                    # If JSON fails, try multipart/form-data
-                    if not success and "422" in str(result):
-                        st.info("Trying alternative upload format...")
-                        success, result = call_welding_api_multipart(image, API_ENDPOINT, None)
-                    
-                    if success:
-                        st.success("✅ Analysis completed successfully!")
+                with st.spinner("Analyzing image with Roboflow AI... This may take a few moments."):
+                    try:
+                        # Call Roboflow API directly with PIL Image
+                        success, result = call_roboflow_api(image)
                         
-                        # Store results in session state
-                        st.session_state.analysis_results = result
-                        st.session_state.analyzed_image = image
-                    else:
-                        st.error(f"❌ Analysis failed: {result}")
-                        
-                        # Add helpful debugging info
-                        with st.expander("🔧 Debugging Information"):
-                            st.write("**API URL:**", API_ENDPOINT)
-                            st.write("**Image Size:**", f"{image.size[0]}x{image.size[1]}")
-                            st.write("**File Size:**", f"{uploaded_file.size:,} bytes")
-                            st.write("**Suggested Solutions:**")
-                            st.write("1. Check if your API endpoint is correct")
-                            st.write("2. Verify the API is running and accessible")
-                            st.write("3. Check if API requires authentication")
-                            st.write("4. Ensure the API accepts image data in the expected format")
+                        if success:
+                            # Process and display results
+                            processed_result = process_roboflow_results(result)
+                            st.success("✅ Analysis completed successfully!")
+                            
+                            # Store results in session state
+                            st.session_state.analysis_results = processed_result
+                            st.session_state.analyzed_image = image
+                        else:
+                            st.error(f"❌ Analysis failed: {result}")
+                            
+                            # Add helpful debugging info
+                            with st.expander("🔧 Debugging Information"):
+                                st.write("**API**: Roboflow Inference API")
+                                st.write("**Model**: weld-4qosh/1")
+                                st.write("**Image Size:**", f"{image.size[0]}x{image.size[1]}")
+                                st.write("**File Size:**", f"{uploaded_file.size:,} bytes")
+                                st.write("**Suggested Solutions:**")
+                                st.write("1. Check your internet connection")
+                                st.write("2. Verify the Roboflow API is accessible")
+                                st.write("3. Ensure the image is clear and contains welding content")
+                                st.write("4. Try with a different image format")
+                                
+                    except Exception as e:
+                        st.error(f"❌ Error occurred: {str(e)}")
     
     with col2:
         st.subheader("📊 Analysis Results")
@@ -430,6 +438,20 @@ def main():
             display_welding_results(st.session_state.analysis_results)
         else:
             st.info("👆 Upload an image and click 'Analyze' to see results here")
+            
+            # Add sample data testing
+            with st.expander("🧪 Test with Sample Data"):
+                st.write("Click below to test the display with sample welding analysis data:")
+                if st.button("Load Sample Results"):
+                    try:
+                        with open("sample_response.json", "r") as f:
+                            sample_data = json.load(f)
+                        st.info("📊 Displaying sample welding analysis results")
+                        display_welding_results(sample_data)
+                    except FileNotFoundError:
+                        st.warning("Sample data file not found")
+                    except Exception as e:
+                        st.error(f"Error loading sample data: {str(e)}")
     
 
 if __name__ == "__main__":
